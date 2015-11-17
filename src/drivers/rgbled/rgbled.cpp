@@ -123,6 +123,8 @@ private:
 namespace
 {
 RGBLED *g_rgbled = nullptr;
+RGBLED *g_rgbled_internal = nullptr;
+RGBLED *g_rgbled_external = nullptr;
 }
 
 void rgbled_usage();
@@ -167,7 +169,31 @@ RGBLED::init()
 	send_led_enable(false);
 	send_led_rgb();
 
-	return OK;
+  /*
+	int external_led = I2C("rgbled_ext", RGBLED1_DEVICE_PATH, PX4_I2C_BUS_EXPANSION, PX4_I2C_OBDEV_LED
+#ifdef __PX4_NUTTX
+	,100000 // maximum speed supported
+#endif
+	)
+
+	if (external_led.init() == OK) {
+    // equivalent of send_led_enable(false)
+    uint8_t settings_byte = 0;
+    // settings_byte |= SETTING_ENABLE;
+    settings_byte |= SETTING_NOT_POWERSAVE;
+    const uint8_t msg[2] = { SUB_ADDR_SETTINGS, settings_byte};
+    external_led.transfer(msg, sizeof(msg), nullptr, 0);
+    // equivalent of send_led_rgb()
+    const uint8_t msg[6] = {
+      SUB_ADDR_PWM0, (uint8_t)((int)(_b * _brightness) >> 4),
+      SUB_ADDR_PWM1, (uint8_t)((int)(_g * _brightness) >> 4),
+      SUB_ADDR_PWM2, (uint8_t)((int)(_r * _brightness) >> 4)
+    };
+    external_led.transfer(msg, sizeof(msg), nullptr, 0);
+	}
+  */
+
+  return OK;
 }
 
 int
@@ -616,11 +642,12 @@ rgbled_main(int argc, char *argv[])
 
 	const char *verb = argv[myoptind];
 
-	int fd;
+	int fd0, fd1;
 	int ret;
 
 	if (!strcmp(verb, "start")) {
-		if (g_rgbled != nullptr) {
+    // if (g_rgbled != nullptr) {
+    if (g_rgbled_external != nullptr && g_rgbled_internal != nullptr) {
 			warnx("already started");
 			return 1;
 		}
@@ -628,38 +655,50 @@ rgbled_main(int argc, char *argv[])
 		if (i2cdevice == -1) {
 			// try the external bus first
 			i2cdevice = PX4_I2C_BUS_EXPANSION;
-			g_rgbled = new RGBLED(PX4_I2C_BUS_EXPANSION, rgbledadr);
+      // g_rgbled_external = new RGBLED(PX4_I2C_BUS_EXPANSION, rgbledadr);
 
-			if (g_rgbled != nullptr && OK != g_rgbled->init()) {
-				delete g_rgbled;
-				g_rgbled = nullptr;
+			if (g_rgbled_external != nullptr && OK != g_rgbled_external->init()) {
+				delete g_rgbled_external;
+				g_rgbled_external = nullptr;
 			}
 
-			if (g_rgbled == nullptr) {
+      if (g_rgbled_external == nullptr) {
 				// fall back to default bus
 				if (PX4_I2C_BUS_LED == PX4_I2C_BUS_EXPANSION) {
 					warnx("no RGB led on bus #%d", i2cdevice);
 					return 1;
 				}
 				i2cdevice = PX4_I2C_BUS_LED;
-			}
+      }
 		}
 
-		if (g_rgbled == nullptr) {
-			g_rgbled = new RGBLED(i2cdevice, rgbledadr);
+		if (g_rgbled_internal == nullptr) {
+			g_rgbled_internal = new RGBLED(i2cdevice, rgbledadr);
 
-			if (g_rgbled == nullptr) {
+			if (g_rgbled_internal == nullptr) {
 				warnx("new failed");
 				return 1;
 			}
 
-			if (OK != g_rgbled->init()) {
-				delete g_rgbled;
-				g_rgbled = nullptr;
+			if (OK != g_rgbled_internal->init()) {
+				delete g_rgbled_internal;
+				g_rgbled_internal = nullptr;
 				warnx("no RGB led on bus #%d", i2cdevice);
 				return 1;
 			}
 		}
+
+    if (g_rgbled_external != nullptr && g_rgbled_internal != nullptr) {
+        // use internal for status indicator when both internal and external LED is present
+        g_rgbled = g_rgbled_internal;
+        // g_rgbled = g_rgbled_external;
+    } else if (g_rgbled_internal != nullptr) {
+        // use internal for status indicator when only internal is present
+        g_rgbled = g_rgbled_internal;
+    } else if (g_rgbled_external != nullptr) {
+        // use external when only external is present (shouldn't happen)
+        g_rgbled = g_rgbled_external;
+    }
 
 		return 0;
 	}
@@ -672,10 +711,15 @@ rgbled_main(int argc, char *argv[])
 	}
 
 	if (!strcmp(verb, "test")) {
-		fd = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd0 = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd1 = px4_open(RGBLED1_DEVICE_PATH, 0);
 
-		if (fd == -1) {
+		if (fd0 == -1) {
 			warnx("Unable to open " RGBLED0_DEVICE_PATH);
+			return 1;
+		}
+		if ( g_rgbled_external && fd1 == -1) {
+			warnx("Unable to open " RGBLED1_DEVICE_PATH);
 			return 1;
 		}
 
@@ -683,31 +727,64 @@ rgbled_main(int argc, char *argv[])
 			{500, 500, 500, 500, 1000, 0 }	// "0" indicates end of pattern
 		};
 
-		ret = px4_ioctl(fd, RGBLED_SET_PATTERN, (unsigned long)&pattern);
-		ret = px4_ioctl(fd, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_PATTERN);
+		ret = px4_ioctl(fd0, RGBLED_SET_PATTERN, (unsigned long)&pattern);
+		if ( g_rgbled_external ) {
+      ret = px4_ioctl(fd1, RGBLED_SET_PATTERN, (unsigned long)&pattern);
+    }
 
-		px4_close(fd);
+		ret = px4_ioctl(fd0, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_PATTERN);
+		if ( g_rgbled_external ) {
+      ret = px4_ioctl(fd1, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_PATTERN);
+    }
+
+		px4_close(fd0);
+		px4_close(fd1);
 		return ret;
 	}
 
 	if (!strcmp(verb, "info")) {
-		g_rgbled->info();
+		// g_rgbled->info();
+    if (g_rgbled_external != nullptr) {
+      g_rgbled_external->info();
+    }
+    if (g_rgbled_internal != nullptr) {
+      g_rgbled_internal->info();
+    }
 		return 0;
 	}
 
 	if (!strcmp(verb, "off") || !strcmp(verb, "stop")) {
-		fd = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd0 = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd1 = px4_open(RGBLED1_DEVICE_PATH, 0);
 
-		if (fd == -1) {
+		if (fd0 == -1) {
 			warnx("Unable to open " RGBLED0_DEVICE_PATH);
 			return 1;
 		}
+		if ( g_rgbled_external && fd1 == -1) {
+			warnx("Unable to open " RGBLED1_DEVICE_PATH);
+			return 1;
+		}
 
-		ret = px4_ioctl(fd, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_OFF);
-		px4_close(fd);
+		ret = px4_ioctl(fd0, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_OFF);
+		if ( g_rgbled_external ) {
+      ret = px4_ioctl(fd1, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_OFF);
+    }
+
+		px4_close(fd0);
+		px4_close(fd1);
+
 		/* delete the rgbled object if stop was requested, in addition to turning off the LED. */
 		if (!strcmp(verb, "stop")) {
-			delete g_rgbled;
+      if (g_rgbled_external != nullptr) {
+        delete g_rgbled_external;
+        g_rgbled_external = nullptr;
+      }
+      if (g_rgbled_internal != nullptr) {
+        delete g_rgbled_internal;
+        g_rgbled_internal = nullptr;
+      }
+			// delete g_rgbled;
 			g_rgbled = nullptr;
 			return 0;
 		}
@@ -720,10 +797,15 @@ rgbled_main(int argc, char *argv[])
 			return 1;
 		}
 
-		fd = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd0 = px4_open(RGBLED0_DEVICE_PATH, 0);
+		fd1 = px4_open(RGBLED1_DEVICE_PATH, 0);
 
-		if (fd == -1) {
+		if (fd0 == -1) {
 			warnx("Unable to open " RGBLED0_DEVICE_PATH);
+			return 1;
+		}
+		if ( g_rgbled_external && fd1 == -1) {
+			warnx("Unable to open " RGBLED1_DEVICE_PATH);
 			return 1;
 		}
 
@@ -731,9 +813,16 @@ rgbled_main(int argc, char *argv[])
 		v.red   = strtol(argv[2], NULL, 0);
 		v.green = strtol(argv[3], NULL, 0);
 		v.blue  = strtol(argv[4], NULL, 0);
-		ret = px4_ioctl(fd, RGBLED_SET_RGB, (unsigned long)&v);
-		ret = px4_ioctl(fd, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_ON);
-		px4_close(fd);
+		if ( fd0 != -1) {
+      ret = px4_ioctl(fd0, RGBLED_SET_RGB, (unsigned long)&v);
+      ret = px4_ioctl(fd0, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_ON);
+      px4_close(fd0);
+    }
+		if ( fd1 != -1) {
+      ret = px4_ioctl(fd1, RGBLED_SET_RGB, (unsigned long)&v);
+      ret = px4_ioctl(fd1, RGBLED_SET_MODE, (unsigned long)RGBLED_MODE_ON);
+      px4_close(fd1);
+    }
 		return ret;
 	}
 

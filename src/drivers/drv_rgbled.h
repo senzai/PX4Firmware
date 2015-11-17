@@ -44,6 +44,7 @@
 
 /* more devices will be 1, 2, etc */
 #define RGBLED0_DEVICE_PATH "/dev/rgbled0"
+#define RGBLED1_DEVICE_PATH "/dev/rgbled1"
 
 /*
  * ioctl() definitions
